@@ -1,0 +1,245 @@
+#include <FirebaseESP32.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <esp_sleep.h>
+
+// Configuration Structure
+struct AppConfig {
+    // Network
+    const char* wifiSSID = "your-wifi-ssid";
+    const char* wifiPass = "your-wifi-password";
+    
+    // Firebase
+    const char* fbHost = "your-firebase-project.firebaseio.com";
+    const char* fbAuth = "your-firebase-auth-key";
+    
+    // Hardware
+    uint8_t relayPin = 5;
+    uint8_t currentPins[2] = {36, 39};  // Start/End current sensors
+    uint8_t voltagePins[2] = {34, 35};  // Start/End voltage sensors
+    
+    // Sensor Calibration (Calibrate these values experimentally)
+    struct {
+        float currentOffset[2] = {0.0, 0.0};  // Zero-current offsets
+        float currentSensitivity = 0.185;     // ACS712 sensitivity (V/A)
+        float voltageDividerRatio = 0.25;     // Voltage divider ratio (R2/(R1+R2))
+        float referenceVoltage = 3.3;         // ESP32 ADC reference
+    } sensors;
+    
+    // Safety Limits
+    float maxAllowedCurrent = 5.0;           // System protection threshold
+    uint16_t minFaultDuration = 50;          // Minimum fault time (ms)
+    uint16_t maxFaultDuration = 200;         // Maximum fault time (ms)
+};
+
+AppConfig cfg;
+
+// Global Objects
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org");
+FirebaseData fbData;
+
+// Filtering Buffers
+const uint8_t SAMPLE_WINDOW = 20;
+float currentBuffer[2][SAMPLE_WINDOW];
+float voltageBuffer[2][SAMPLE_WINDOW];
+
+// System State
+enum SystemState { IDLE, FAULT_INJECTION, DATA_COLLECTION, RECOVERY };
+SystemState currentState = IDLE;
+uint32_t stateEntryTime = 0;
+
+void setup() {
+    Serial.begin(115200);
+    initHardware();
+    connectWiFi();
+    initFirebase();
+    initTimeSync();
+    calibrateSensors();
+}
+
+void loop() {
+    switch(currentState) {
+        case IDLE:
+            if(safeToProceed()) {
+                currentState = FAULT_INJECTION;
+                stateEntryTime = millis();
+            }
+            break;
+
+        case FAULT_INJECTION:
+            injectFault();
+            if(verifyFaultInjection()) {
+                currentState = DATA_COLLECTION;
+                stateEntryTime = millis();
+            } else {
+                handleFaultError();
+                currentState = RECOVERY;
+            }
+            break;
+
+        case DATA_COLLECTION:
+            if(millis() - stateEntryTime >= 1000) {
+                collectAndSendData();
+                currentState = RECOVERY;
+                stateEntryTime = millis();
+            }
+            break;
+
+        case RECOVERY:
+            if(millis() - stateEntryTime >= cfg.sensors.recoveryTime) {
+                if(verifySystemRecovery()) {
+                    currentState = IDLE;
+                    enterDeepSleep(300);  // Power saving
+                } else {
+                    handleRecoveryFailure();
+                }
+            }
+            break;
+    }
+}
+
+// Hardware Initialization
+void initHardware() {
+    pinMode(cfg.relayPin, OUTPUT);
+    digitalWrite(cfg.relayPin, LOW);
+    
+    analogReadResolution(12);
+    analogSetAttenuation(ADC_11db);
+}
+
+// WiFi Connection
+void connectWiFi() {
+    WiFi.begin(cfg.wifiSSID, cfg.wifiPass);
+    Serial.print("Connecting to WiFi");
+    while(WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nConnected: " + WiFi.localIP());
+}
+
+// Firebase Initialization
+void initFirebase() {
+    Firebase.begin(cfg.fbHost, cfg.fbAuth);
+    Firebase.reconnectWiFi(true);
+    Firebase.setMaxRetry(fbData, 3);
+    Firebase.setwriteSizeLimit(fbData, "tiny");
+}
+
+// Time Synchronization
+void initTimeSync() {
+    timeClient.begin();
+    timeClient.setTimeOffset(0);
+    while(!timeClient.update()) {
+        timeClient.forceUpdate();
+    }
+}
+
+// Sensor Calibration
+void calibrateSensors() {
+    Serial.println("Calibrating sensors...");
+    for(int i=0; i<2; i++) {
+        float sum = 0;
+        for(int j=0; j<100; j++) {
+            sum += analogRead(cfg.currentPins[i]);
+            delay(10);
+        }
+        cfg.sensors.currentOffset[i] = (sum/100) * cfg.sensors.referenceVoltage / 4095.0;
+    }
+}
+
+// Fault Injection with Validation
+void injectFault() {
+    digitalWrite(cfg.relayPin, HIGH);
+    delay(map(analogRead(cfg.voltagePins[0]), 0, 4095, cfg.minFaultDuration, cfg.maxFaultDuration));
+    digitalWrite(cfg.relayPin, LOW);
+}
+
+bool verifyFaultInjection() {
+    float current = readFilteredCurrent(0);
+    return (current > cfg.maxAllowedCurrent * 0.8);
+}
+
+// Advanced Sensor Reading with Filtering
+float readFilteredCurrent(uint8_t sensorIndex) {
+    static uint8_t ptr[2] = {0};
+    
+    // Update circular buffer
+    currentBuffer[sensorIndex][ptr[sensorIndex]] = 
+        (analogRead(cfg.currentPins[sensorIndex]) * cfg.sensors.referenceVoltage / 4095.0 
+         - cfg.sensors.currentOffset[sensorIndex]) 
+        / cfg.sensors.currentSensitivity;
+    
+    ptr[sensorIndex] = (ptr[sensorIndex] + 1) % SAMPLE_WINDOW;
+    
+    // Calculate moving average
+    float sum = 0;
+    for(int i=0; i<SAMPLE_WINDOW; i++) {
+        sum += currentBuffer[sensorIndex][i];
+    }
+    return sum / SAMPLE_WINDOW;
+}
+
+float readFilteredVoltage(uint8_t sensorIndex) {
+    static uint8_t ptr[2] = {0};
+    
+    voltageBuffer[sensorIndex][ptr[sensorIndex]] = 
+        analogRead(cfg.voltagePins[sensorIndex]) 
+        * cfg.sensors.referenceVoltage / 4095.0 
+        / cfg.sensors.voltageDividerRatio;
+    
+    ptr[sensorIndex] = (ptr[sensorIndex] + 1) % SAMPLE_WINDOW;
+    
+    float sum = 0;
+    for(int i=0; i<SAMPLE_WINDOW; i++) {
+        sum += voltageBuffer[sensorIndex][i];
+    }
+    return sum / SAMPLE_WINDOW;
+}
+
+// Data Collection and Transmission
+void collectAndSendData() {
+    FirebaseJson payload;
+    String timestamp = timeClient.getFormattedDate();
+    
+    payload.add("timestamp", timestamp);
+    payload.add("current_start", readFilteredCurrent(0));
+    payload.add("current_end", readFilteredCurrent(1));
+    payload.add("voltage_start", readFilteredVoltage(0));
+    payload.add("voltage_end", readFilteredVoltage(1));
+    payload.add("fault_duration", millis() - stateEntryTime);
+
+    if(Firebase.pushJSON(fbData, "/fault_logs", payload)) {
+        Serial.println("Data pushed successfully");
+    } else {
+        Serial.println("Firebase error: " + fbData.errorReason());
+    }
+}
+
+// Safety Checks
+bool safeToProceed() {
+    return (readFilteredVoltage(0) > 11.0 &&  // Check system voltage
+            readFilteredCurrent(0) < 0.1 &&   // Check residual current
+            timeClient.isTimeSet());          // Ensure valid timestamps
+}
+
+// Power Management
+void enterDeepSleep(uint32_t duration) {
+    Serial.println("Entering deep sleep");
+    esp_sleep_enable_timer_wakeup(duration * 1000);
+    esp_deep_sleep_start();
+}
+
+// Error Handling
+void handleFaultError() {
+    Serial.println("Fault injection failed!");
+    digitalWrite(cfg.relayPin, LOW);
+    enterDeepSleep(5000);  // Extended recovery period
+}
+
+void handleRecoveryFailure() {
+    Serial.println("System recovery failed!");
+    enterDeepSleep(10000);  // Emergency shutdown
+
+}
